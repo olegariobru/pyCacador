@@ -1,0 +1,664 @@
+"""
+Cacador de Duplicatas - Interface Grafica
+Compativel com Python 2.7+ e 3.x
+Gera .exe via: pyinstaller --onefile --windowed cacador_duplicatas.py
+"""
+
+import os
+import sys
+import hashlib
+import csv
+import threading
+import time
+from datetime import datetime
+
+# Compatibilidade Python 2/3
+if sys.version_info[0] >= 3:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+else:
+    import Tkinter as tk
+    import ttk
+    import tkFileDialog as filedialog
+    import tkMessageBox as messagebox
+
+# ════════════════════════════════════════
+#  LOGICA DE NEGOCIO
+# ════════════════════════════════════════
+
+SKIP_DIRS = {
+    'node_modules', '.git', '__pycache__', '.venv', 'venv',
+    'windows', 'program files', 'program files (x86)',
+    'appdata', '$recycle.bin', 'system volume information',
+    'temp', 'tmp'
+}
+
+def format_size(b):
+    if b >= 1073741824: return "{:.1f} GB".format(b / 1073741824.0)
+    if b >= 1048576:    return "{:.1f} MB".format(b / 1048576.0)
+    if b >= 1024:       return "{:.0f} KB".format(b / 1024.0)
+    return "{} B".format(b)
+
+def should_skip(path):
+    parts = path.lower().replace('\\', '/').split('/')
+    for part in parts:
+        if part in SKIP_DIRS:
+            return True
+    return False
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+def find_duplicates(folder, min_size, extension, progress_cb, cancel_flag):
+    """
+    Retorna (grupos, erros)
+    grupos = lista de dicts {hash, size, paths, recoverable}
+    """
+    # Passo 1: listar arquivos
+    progress_cb('status', 'Listando arquivos...')
+    all_files = []
+    for root, dirs, files in os.walk(folder):
+        if cancel_flag[0]: return [], []
+        if should_skip(root): continue
+        for fname in files:
+            if fname.startswith('.'): continue
+            if extension and not fname.lower().endswith(extension.lower()): continue
+            fpath = os.path.join(root, fname)
+            try:
+                size = os.path.getsize(fpath)
+                if size >= min_size:
+                    all_files.append((fpath, size))
+            except Exception:
+                pass
+
+    progress_cb('total_files', len(all_files))
+
+    # Passo 2: agrupar por tamanho
+    progress_cb('status', 'Agrupando por tamanho...')
+    size_map = {}
+    for fpath, size in all_files:
+        size_map.setdefault(size, []).append(fpath)
+
+    candidates = []
+    for size, paths in size_map.items():
+        if len(paths) > 1:
+            for p in paths:
+                candidates.append((p, size))
+
+    if not candidates:
+        return [], []
+
+    # Passo 3: calcular hashes
+    progress_cb('status', 'Calculando hashes...')
+    total = len(candidates)
+    hash_map = {}
+    errors = []
+    start = time.time()
+
+    for i, (fpath, size) in enumerate(candidates):
+        if cancel_flag[0]: return [], []
+
+        pct = int((i + 1) / float(total) * 100)
+        elapsed = time.time() - start
+        if pct > 0:
+            rem = int(elapsed / pct * (100 - pct))
+        else:
+            rem = 0
+        rem_str = "{:02d}:{:02d}".format(rem // 60, rem % 60)
+        progress_cb('hash_progress', (i + 1, total, pct, rem_str))
+
+        h = sha256_file(fpath)
+        if h:
+            hash_map.setdefault(h, []).append((fpath, size))
+        else:
+            errors.append(fpath)
+
+    # Passo 4: montar grupos
+    grupos = []
+    for h, items in hash_map.items():
+        if len(items) < 2: continue
+        size = items[0][1]
+        paths = [p for p, _ in items]
+        recoverable = size * (len(paths) - 1)
+        grupos.append({
+            'hash': h,
+            'size': size,
+            'paths': paths,
+            'recoverable': recoverable,
+        })
+
+    # Ordenar por espaco recuperavel decrescente
+    grupos.sort(key=lambda g: g['recoverable'], reverse=True)
+    return grupos, errors
+
+
+# ════════════════════════════════════════
+#  INTERFACE GRAFICA
+# ════════════════════════════════════════
+
+class App(tk.Tk):
+    # Cores - tema minimalista branco
+    BG       = '#ffffff'
+    PANEL    = '#f5f5f5'
+    ACCENT   = '#e8e8e8'
+    BLUE     = '#2563eb'
+    TEXT     = '#1a1a1a'
+    MUTED    = '#6b7280'
+    GREEN    = '#16a34a'
+    RED      = '#dc2626'
+    YELLOW   = '#d97706'
+    ROWEVEN  = '#f9f9f9'
+    ROWODD   = '#ffffff'
+
+    def __init__(self):
+        tk.Tk.__init__(self)
+        self.title('Cacador de Duplicatas')
+        self.configure(bg=self.BG)
+        self.resizable(True, True)
+        self.minsize(860, 580)
+
+        # Tentar maximizar
+        try:
+            self.state('zoomed')
+        except Exception:
+            self.geometry('1024x700')
+
+        self.grupos = []
+        self.errors = []
+        self.cancel_flag = [False]
+        self.scan_thread = None
+
+        self._build_ui()
+
+    # ── Construcao da UI ──────────────────
+
+    def _build_ui(self):
+        # Cabecalho
+        header = tk.Frame(self, bg=self.ACCENT, pady=12)
+        header.pack(fill='x')
+        tk.Label(header, text='  CACADOR DE DUPLICATAS',
+                 bg=self.ACCENT, fg=self.TEXT,
+                 font=('Segoe UI', 14, 'bold')).pack(side='left')
+        tk.Label(header, text='SHA-256  |  Win7+  ',
+                 bg=self.ACCENT, fg=self.MUTED,
+                 font=('Segoe UI', 9)).pack(side='right')
+
+        # Painel de configuracao
+        cfg = tk.Frame(self, bg=self.PANEL, pady=10, padx=14)
+        cfg.pack(fill='x', padx=10, pady=(10, 0))
+
+        # Linha 1: pasta
+        row1 = tk.Frame(cfg, bg=self.PANEL)
+        row1.pack(fill='x', pady=3)
+        tk.Label(row1, text='Pasta:', bg=self.PANEL, fg=self.MUTED,
+                 font=('Segoe UI', 9), width=10, anchor='w').pack(side='left')
+        self.var_path = tk.StringVar()
+        tk.Entry(row1, textvariable=self.var_path, bg=self.ACCENT,
+                 fg=self.TEXT, insertbackground=self.TEXT,
+                 font=('Segoe UI', 9), relief='flat', bd=4).pack(side='left', fill='x', expand=True, padx=(0,6))
+        self._btn(row1, 'Selecionar...', self._pick_folder).pack(side='left')
+
+        # Linha 2: opcoes
+        row2 = tk.Frame(cfg, bg=self.PANEL)
+        row2.pack(fill='x', pady=3)
+
+        tk.Label(row2, text='Tam. min:', bg=self.PANEL, fg=self.MUTED,
+                 font=('Segoe UI', 9), width=10, anchor='w').pack(side='left')
+        self.var_minsize = tk.StringVar(value='1024')
+        tk.Entry(row2, textvariable=self.var_minsize, bg=self.ACCENT,
+                 fg=self.TEXT, insertbackground=self.TEXT,
+                 font=('Segoe UI', 9), relief='flat', bd=4, width=10).pack(side='left', padx=(0,16))
+
+        tk.Label(row2, text='Extensao:', bg=self.PANEL, fg=self.MUTED,
+                 font=('Segoe UI', 9)).pack(side='left')
+        self.var_ext = tk.StringVar()
+        tk.Entry(row2, textvariable=self.var_ext, bg=self.ACCENT,
+                 fg=self.TEXT, insertbackground=self.TEXT,
+                 font=('Segoe UI', 9), relief='flat', bd=4, width=8).pack(side='left', padx=(4,16))
+        tk.Label(row2, text='(ex: .jpg)', bg=self.PANEL, fg=self.MUTED,
+                 font=('Segoe UI', 8)).pack(side='left', padx=(0,24))
+
+        self.var_silent = tk.BooleanVar()
+        tk.Checkbutton(row2, text='Modo silencioso', variable=self.var_silent,
+                       bg=self.PANEL, fg=self.MUTED, selectcolor=self.ACCENT,
+                       activebackground=self.PANEL, font=('Segoe UI', 9)).pack(side='left')
+
+        # Botoes de acao
+        row3 = tk.Frame(cfg, bg=self.PANEL)
+        row3.pack(fill='x', pady=(8, 2))
+        self.btn_scan   = self._btn(row3, '▶  INICIAR VARREDURA', self._start_scan, big=True, color=self.GREEN)
+        self.btn_scan.pack(side='left', padx=(0, 8))
+        self.btn_cancel = self._btn(row3, '■  CANCELAR', self._cancel_scan, color=self.RED)
+        self.btn_cancel.pack(side='left', padx=(0, 8))
+        self.btn_cancel.config(state='disabled')
+        self.btn_export = self._btn(row3, '💾  EXPORTAR', self._export, color=self.YELLOW)
+        self.btn_export.pack(side='left', padx=(0,8))
+        self.btn_export.config(state='disabled')
+        self.btn_delete = self._btn(row3, '🗑  DELETAR SELECIONADOS', self._delete_selected, color=self.RED)
+        self.btn_delete.pack(side='left')
+        self.btn_delete.config(state='disabled')
+
+        # Barra de progresso
+        prog_frame = tk.Frame(self, bg=self.BG)
+        prog_frame.pack(fill='x', padx=10, pady=(6, 0))
+        self.lbl_status = tk.Label(prog_frame, text='Pronto.', bg=self.BG, fg=self.MUTED,
+                                   font=('Segoe UI', 9), anchor='w')
+        self.lbl_status.pack(fill='x')
+        self.progressbar = ttk.Progressbar(prog_frame, mode='determinate', maximum=100)
+        self.progressbar.pack(fill='x', pady=(2, 0))
+        style = ttk.Style()
+        style.theme_use('default')
+        style.configure('TProgressbar', troughcolor=self.ACCENT, background=self.GREEN,
+                        thickness=6)
+
+        # Tabela de resultados
+        tbl_frame = tk.Frame(self, bg=self.BG)
+        tbl_frame.pack(fill='both', expand=True, padx=10, pady=8)
+
+        cols = ('grupo', 'arquivo', 'tamanho', 'recuperavel', 'hash')
+        self.tree = ttk.Treeview(tbl_frame, columns=cols, show='headings', selectmode='extended')
+
+        style.configure('Treeview',
+                        background=self.ROWODD, foreground=self.TEXT,
+                        fieldbackground=self.ROWODD, font=('Segoe UI', 9),
+                        rowheight=22)
+        style.configure('Treeview.Heading',
+                        background=self.ACCENT, foreground=self.TEXT,
+                        font=('Segoe UI', 9, 'bold'), relief='flat')
+        style.map('Treeview', background=[('selected', '#dbeafe')])
+
+        headers = {'grupo': ('Grupo', 55), 'arquivo': ('Arquivo', 480),
+                   'tamanho': ('Tamanho', 80), 'recuperavel': ('Recuperavel', 100),
+                   'hash': ('SHA-256', 140)}
+        for c, (label, width) in headers.items():
+            self.tree.heading(c, text=label,
+                              command=lambda _c=c: self._sort_by(_c))
+            self.tree.column(c, width=width, minwidth=40)
+
+        self.tree.tag_configure('even', background=self.ROWEVEN)
+        self.tree.tag_configure('odd',  background=self.ROWODD)
+        self.tree.tag_configure('header', background='#eff6ff', foreground=self.BLUE)
+
+        sb_y = ttk.Scrollbar(tbl_frame, orient='vertical',   command=self.tree.yview)
+        sb_x = ttk.Scrollbar(tbl_frame, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
+
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        sb_y.grid(row=0, column=1, sticky='ns')
+        sb_x.grid(row=1, column=0, sticky='ew')
+        tbl_frame.grid_rowconfigure(0, weight=1)
+        tbl_frame.grid_columnconfigure(0, weight=1)
+
+        self.tree.bind('<Double-1>', self._open_folder)
+        self.tree.bind('<Button-3>', self._ctx_menu)
+
+        # Rodape
+        footer = tk.Frame(self, bg=self.PANEL, pady=6)
+        footer.pack(fill='x')
+        self.lbl_summary = tk.Label(footer, text='',
+                                    bg=self.PANEL, fg=self.TEXT,
+                                    font=('Segoe UI', 9))
+        self.lbl_summary.pack(side='left', padx=14)
+        tk.Label(footer,
+                 text='Duplo clique = abrir pasta  |  Botao direito = opcoes  |  Ctrl+A = selecionar tudo',
+                 bg=self.PANEL, fg=self.MUTED, font=('Segoe UI', 8)).pack(side='right', padx=14)
+
+    def _btn(self, parent, text, cmd, big=False, color=None):
+        c = color or self.BLUE
+        f = ('Segoe UI', 9, 'bold') if big else ('Segoe UI', 9)
+        b = tk.Button(parent, text=text, command=cmd,
+                      bg=self.ACCENT, fg=c, activebackground=self.BG,
+                      activeforeground=c, font=f, relief='flat',
+                      padx=12, pady=5, cursor='hand2', bd=0)
+        b.bind('<Enter>', lambda e: b.config(bg=self.BG))
+        b.bind('<Leave>', lambda e: b.config(bg=self.ACCENT))
+        return b
+
+    # ── Selecao de pasta ─────────────────
+
+    def _pick_folder(self):
+        folder = filedialog.askdirectory(title='Selecione a pasta para escanear')
+        if folder:
+            self.var_path.set(folder)
+
+    # ── Varredura ────────────────────────
+
+    def _start_scan(self):
+        folder = self.var_path.get().strip()
+        if not folder:
+            folder = filedialog.askdirectory(title='Selecione a pasta para escanear')
+            if not folder: return
+            self.var_path.set(folder)
+
+        if not os.path.isdir(folder):
+            messagebox.showerror('Erro', 'Pasta invalida: ' + folder)
+            return
+
+        try:
+            min_size = int(self.var_minsize.get())
+        except ValueError:
+            min_size = 1024
+
+        ext = self.var_ext.get().strip()
+        if ext and not ext.startswith('.'):
+            ext = '.' + ext
+
+        self.grupos = []
+        self.errors = []
+        self.cancel_flag = [False]
+        self._clear_table()
+        self.btn_scan.config(state='disabled')
+        self.btn_cancel.config(state='normal')
+        self.btn_export.config(state='disabled')
+        self.btn_delete.config(state='disabled')
+        self.lbl_summary.config(text='')
+        self.progressbar['value'] = 0
+
+        self.scan_thread = threading.Thread(
+            target=self._scan_worker,
+            args=(folder, min_size, ext)
+        )
+        self.scan_thread.daemon = True
+        self.scan_thread.start()
+
+    def _scan_worker(self, folder, min_size, ext):
+        def progress(kind, val):
+            self.after(0, lambda: self._on_progress(kind, val))
+
+        grupos, errors = find_duplicates(folder, min_size, ext, progress, self.cancel_flag)
+        self.grupos = grupos
+        self.errors = errors
+        self.after(0, self._on_scan_done)
+
+    def _on_progress(self, kind, val):
+        if kind == 'status':
+            self.lbl_status.config(text='  ' + val)
+        elif kind == 'total_files':
+            self.lbl_status.config(text='  {} arquivos encontrados'.format(val))
+        elif kind == 'hash_progress':
+            done, total, pct, rem = val
+            self.lbl_status.config(
+                text='  Calculando hashes... {}/{} ({}%) - restam ~{}'.format(done, total, pct, rem))
+            self.progressbar['value'] = pct
+
+    def _on_scan_done(self):
+        self.btn_scan.config(state='normal')
+        self.btn_cancel.config(state='disabled')
+
+        if self.cancel_flag[0]:
+            self.lbl_status.config(text='  Varredura cancelada.')
+            self.progressbar['value'] = 0
+            return
+
+        self.progressbar['value'] = 100
+
+        if not self.grupos:
+            self.lbl_status.config(text='  Nenhuma duplicata encontrada.')
+            messagebox.showinfo('Resultado', 'Nenhuma duplicata encontrada!')
+            return
+
+        self._populate_table()
+        self.btn_export.config(state='normal')
+        self.btn_delete.config(state='normal')
+
+        # Resumo
+        total_rec  = sum(g['recoverable'] for g in self.grupos)
+        total_dup  = sum(len(g['paths']) for g in self.grupos)
+        self.lbl_summary.config(
+            text='  {} grupos  |  {} arquivos duplicados  |  {} recuperaveis'.format(
+                len(self.grupos), total_dup, format_size(total_rec)))
+        self.lbl_status.config(text='  Varredura concluida.')
+
+        if self.errors:
+            self.lbl_status.config(
+                text='  Concluido com {} arquivo(s) inacessivel(is).'.format(len(self.errors)))
+
+        # Modo silencioso: exportar automaticamente
+        if self.var_silent.get():
+            self._export(silent=True)
+
+    def _cancel_scan(self):
+        self.cancel_flag[0] = True
+        self.lbl_status.config(text='  Cancelando...')
+
+    # ── Tabela ───────────────────────────
+
+    def _clear_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+    def _populate_table(self):
+        self._clear_table()
+        row_idx = 0
+        for gi, grupo in enumerate(self.grupos):
+            rec_str  = format_size(grupo['recoverable'])
+            size_str = format_size(grupo['size'])
+            short_hash = grupo['hash'][:16] + '...'
+
+            # Linha de cabecalho do grupo
+            self.tree.insert('', 'end',
+                iid='g{}'.format(gi),
+                values=('Grupo {}'.format(gi + 1),
+                        '{} copias  |  {} cada  |  {} recuperaveis'.format(
+                            len(grupo['paths']), size_str, rec_str),
+                        '', '', short_hash),
+                tags=('header',))
+
+            # Arquivos do grupo
+            for pi, path in enumerate(grupo['paths']):
+                tag = 'even' if row_idx % 2 == 0 else 'odd'
+                self.tree.insert('', 'end',
+                    iid='g{}p{}'.format(gi, pi),
+                    values=('', path, size_str, rec_str if pi > 0 else '(original)', short_hash),
+                    tags=(tag,))
+                row_idx += 1
+
+    def _sort_by(self, col):
+        pass  # Pode ser expandido futuramente
+
+    # ── Duplo clique: abrir pasta ────────
+
+    def _open_folder(self, event):
+        sel = self.tree.selection()
+        if not sel: return
+        item = self.tree.item(sel[0])
+        path = item['values'][1] if item['values'] else ''
+        if os.path.isfile(str(path)):
+            folder = os.path.dirname(str(path))
+            try:
+                os.startfile(folder)
+            except Exception as e:
+                messagebox.showerror('Erro', str(e))
+
+    # ── Menu de contexto (botao direito) ─
+
+    def _ctx_menu(self, event):
+        sel = self.tree.identify_row(event.y)
+        if not sel: return
+        self.tree.selection_set(sel)
+        item = self.tree.item(sel)
+        path = str(item['values'][1]) if item['values'] else ''
+        if not os.path.isfile(path): return
+
+        menu = tk.Menu(self, tearoff=0, bg=self.PANEL, fg=self.TEXT,
+                       activebackground=self.ACCENT, font=('Segoe UI', 9))
+        menu.add_command(label='Abrir pasta',
+                         command=lambda: os.startfile(os.path.dirname(path)))
+        menu.add_command(label='Deletar este arquivo',
+                         command=lambda: self._delete_one(path))
+        menu.add_separator()
+        menu.add_command(label='Copiar caminho',
+                         command=lambda: self._copy_to_clipboard(path))
+        menu.post(event.x_root, event.y_root)
+
+    def _copy_to_clipboard(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    # ── Delecao ──────────────────────────
+
+    def _delete_one(self, path):
+        if messagebox.askyesno('Confirmar', 'Deletar este arquivo?\n\n' + path):
+            try:
+                os.remove(path)
+                messagebox.showinfo('OK', 'Arquivo deletado.')
+                self._refresh_after_delete(path)
+            except Exception as e:
+                messagebox.showerror('Erro', str(e))
+
+    def _delete_selected(self):
+        sel = self.tree.selection()
+        paths = []
+        for iid in sel:
+            item = self.tree.item(iid)
+            path = str(item['values'][1]) if item['values'] else ''
+            if os.path.isfile(path):
+                paths.append(path)
+
+        if not paths:
+            messagebox.showwarning('Aviso', 'Selecione arquivos na lista para deletar.\n'
+                                            'Use Ctrl+clique para selecionar varios.\n'
+                                            'Linhas de cabecalho de grupo sao ignoradas.')
+            return
+
+        msg = 'Deletar {} arquivo(s) selecionado(s)?\n\n'.format(len(paths))
+        msg += '\n'.join(paths[:10])
+        if len(paths) > 10:
+            msg += '\n... e mais {}'.format(len(paths) - 10)
+
+        if not messagebox.askyesno('Confirmar delecao', msg):
+            return
+
+        deleted = 0
+        failed  = []
+        for path in paths:
+            try:
+                os.remove(path)
+                self._refresh_after_delete(path)
+                deleted += 1
+            except Exception as e:
+                failed.append('{} ({})'.format(path, e))
+
+        msg = '{} arquivo(s) deletado(s).'.format(deleted)
+        if failed:
+            msg += '\n\nFalhou:\n' + '\n'.join(failed)
+        messagebox.showinfo('Resultado', msg)
+
+    def _refresh_after_delete(self, deleted_path):
+        # Remove da tabela
+        for iid in self.tree.get_children():
+            item = self.tree.item(iid)
+            if str(item['values'][1]) == deleted_path:
+                self.tree.delete(iid)
+                break
+        # Remove dos grupos internos
+        for grupo in self.grupos:
+            if deleted_path in grupo['paths']:
+                grupo['paths'].remove(deleted_path)
+
+    # ── Exportar ─────────────────────────
+
+    def _export(self, silent=False):
+        if not self.grupos:
+            if not silent:
+                messagebox.showwarning('Aviso', 'Nenhum resultado para exportar.')
+            return
+
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+
+        if silent:
+            script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            base = os.path.join(script_dir, 'duplicatas_' + timestamp)
+        else:
+            base = filedialog.asksaveasfilename(
+                title='Salvar relatorio',
+                defaultextension='.txt',
+                initialfile='duplicatas_' + timestamp,
+                filetypes=[('Texto', '*.txt'), ('CSV', '*.csv'), ('Todos', '*.*')]
+            )
+            if not base: return
+            if base.endswith('.txt') or base.endswith('.csv'):
+                base = base[:-4]
+
+        txt_path = base + '.txt'
+        csv_path = base + '.csv'
+        err_path = base + '_erros.txt'
+
+        # TXT
+        lines = []
+        lines.append('CACADOR DE DUPLICATAS - Relatorio')
+        lines.append('Gerado em: ' + datetime.now().strftime('%d/%m/%Y %H:%M:%S'))
+        lines.append('=' * 60)
+        lines.append('')
+        total_rec = 0
+        total_dup = 0
+        for gi, grupo in enumerate(self.grupos):
+            total_rec += grupo['recoverable']
+            total_dup += len(grupo['paths'])
+            lines.append('Grupo {} -- {} copias -- {} recuperaveis'.format(
+                gi + 1, len(grupo['paths']), format_size(grupo['recoverable'])))
+            lines.append('SHA-256: ' + grupo['hash'])
+            for path in grupo['paths']:
+                lines.append('    ' + path)
+            lines.append('')
+        lines.append('=' * 60)
+        lines.append('Grupos de duplicatas : {}'.format(len(self.grupos)))
+        lines.append('Arquivos duplicados  : {}'.format(total_dup))
+        lines.append('Espaco recuperavel   : {}'.format(format_size(total_rec)))
+
+        try:
+            with open(txt_path, 'w') as f:
+                f.write('\n'.join(lines))
+        except Exception as e:
+            if not silent:
+                messagebox.showerror('Erro', 'Nao foi possivel salvar TXT:\n' + str(e))
+
+        # CSV
+        try:
+            with open(csv_path, 'w') as f:
+                writer = csv.writer(f, delimiter=';')
+                writer.writerow(['Grupo', 'Arquivo', 'Tamanho', 'Recuperavel', 'Hash'])
+                for gi, grupo in enumerate(self.grupos):
+                    for path in grupo['paths']:
+                        writer.writerow([
+                            gi + 1, path,
+                            format_size(grupo['size']),
+                            format_size(grupo['recoverable']),
+                            grupo['hash']
+                        ])
+        except Exception as e:
+            if not silent:
+                messagebox.showerror('Erro', 'Nao foi possivel salvar CSV:\n' + str(e))
+
+        # Log de erros
+        if self.errors:
+            try:
+                with open(err_path, 'w') as f:
+                    f.write('\n'.join(self.errors))
+            except Exception:
+                pass
+
+        if not silent:
+            msg = 'Relatorio salvo:\n\n  {}\n  {}'.format(txt_path, csv_path)
+            if self.errors:
+                msg += '\n  {} (erros)'.format(err_path)
+            messagebox.showinfo('Exportado!', msg)
+
+
+# ════════════════════════════════════════
+#  ENTRADA
+# ════════════════════════════════════════
+
+if __name__ == '__main__':
+    app = App()
+    app.mainloop()
