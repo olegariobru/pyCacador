@@ -1,0 +1,22 @@
+name: Python syntax check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile source
+        run: python -c "from pathlib import Path; compile(Path('pyCacador.txt').read_text(encoding='utf-8'), 'pyCacador.txt', 'exec')"
